@@ -249,3 +249,24 @@ Describe 'report' {
         (Get-Content $json -Raw | ConvertFrom-Json).Findings[0].Id | Should -Be 'x'
     }
 }
+
+Describe 'Get-WHEvent' {
+    BeforeAll {
+        # Pester can only mock commands that exist; Get-WinEvent is Windows-only.
+        if (-not (Get-Command Get-WinEvent -ErrorAction SilentlyContinue)) {
+            function global:Get-WinEvent { param($FilterHashtable, $MaxEvents) }
+        }
+    }
+    It 'returns nothing when <Message>' -TestCases @(
+        @{ Message = 'No events were found that match the specified selection criteria.' }
+        @{ Message = 'The specified providers do not write events to any of the specified logs.' }
+        @{ Message = 'There is not an event log on the localhost computer that matches "Foo".' }
+    ) {
+        Mock Get-WinEvent { throw $Message }
+        @(Get-WHEvent @{ LogName = 'Application'; ProviderName = 'X' }).Count | Should -Be 0
+    }
+    It 'rethrows other errors' {
+        Mock Get-WinEvent { throw 'Access is denied' }
+        { Get-WHEvent @{ LogName = 'Security' } } | Should -Throw '*Access is denied*'
+    }
+}

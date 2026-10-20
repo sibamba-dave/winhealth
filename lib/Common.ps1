@@ -36,7 +36,7 @@ function Get-WHEvent {
     } catch {
         if ($_.FullyQualifiedErrorId -match 'NoMatchingEventsFound|NoMatchingLogsFound|NoMatchingProvidersFound') {
             @()
-        } elseif ($_.Exception.Message -match 'No events were found|There is not an event log') {
+        } elseif ($_.Exception.Message -match 'No events were found|There is not an event log|providers do not write events to any of the specified logs') {
             @()
         } else {
             throw
