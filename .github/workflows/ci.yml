@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint (PSScriptAnalyzer)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $issues = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          $issues | Format-Table -AutoSize | Out-String -Width 200
+          if ($issues) { exit 1 }
+
+      - name: Unit tests (Pester)
+        shell: pwsh
+        run: |
+          Install-Module Pester -MinimumVersion 5.5 -Force -Scope CurrentUser -SkipPublisherCheck
+          $r = Invoke-Pester ./tests -Output Detailed -PassThru
+          if ($r.FailedCount) { exit 1 }
+
+      - name: Smoke run (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          .\WinHealth.ps1 -Days 7 -NoOpen -NoPrompt -OutputPath "$env:RUNNER_TEMP\report-ps51"
+          $j = Get-Content "$env:RUNNER_TEMP\report-ps51\report.json" -Raw | ConvertFrom-Json
+          $j.Findings | Format-Table Severity, Category, Title -AutoSize | Out-String -Width 200
+          $failed = @($j.Findings | Where-Object { $_.Id -like 'error-*' })
+          if ($failed) { $failed | Format-List; exit 1 }
+
+      - name: Smoke run (PowerShell 7) + fix dry run
+        shell: pwsh
+        run: |
+          ./WinHealth.ps1 -Days 7 -NoOpen -NoPrompt -OutputPath "$env:RUNNER_TEMP\report-ps7" -Fix Recommended -WhatIf -NoRestorePoint
+          $j = Get-Content "$env:RUNNER_TEMP\report-ps7\report.json" -Raw | ConvertFrom-Json
+          $failed = @($j.Findings | Where-Object { $_.Id -like 'error-*' })
+          if ($failed) { $failed | Format-List; exit 1 }
+          ./WinHealth.ps1 -ListFixes
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sample-reports
+          path: ${{ runner.temp }}/report-*
