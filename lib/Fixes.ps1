@@ -160,7 +160,9 @@ function Get-WHFixCatalog {
             Applies = { @(Get-WHNvmeOverride).Count -gt 0 }
             Action = {
                 $key = 'HKLM:\SYSTEM\CurrentControlSet\Policies\Microsoft\FeatureManagement\Overrides'
-                foreach ($name in @(Get-WHNvmeOverride)) {
+                $names = @(Get-WHNvmeOverride)
+                if (-not $names) { throw 'None of the known overrides are set; the driver was enabled some other way (e.g. ViVeTool).' }
+                foreach ($name in $names) {
                     Remove-ItemProperty -Path $key -Name $name -ErrorAction Stop
                     Write-Host "    removed override $name (was 1)"
                 }
@@ -257,8 +259,13 @@ function Invoke-WHFix {
         Write-Host "==> $($fix.Title)" -ForegroundColor Cyan
         $status = 'Applied'; $message = ''
         try {
-            & $fix.Action ([bool]$Unattended)
-            Write-Host '    OK' -ForegroundColor Green
+            if (-not (Test-WHFixApplies -Catalog $catalog -Id $id -Cache @{})) {
+                $status = 'Skipped'; $message = 'Nothing to change on this PC.'
+                Write-Host "    SKIPPED: $message" -ForegroundColor Yellow
+            } else {
+                & $fix.Action ([bool]$Unattended)
+                Write-Host '    OK' -ForegroundColor Green
+            }
         } catch {
             $status = 'Failed'; $message = $_.Exception.Message
             Write-Host "    FAILED: $message" -ForegroundColor Red

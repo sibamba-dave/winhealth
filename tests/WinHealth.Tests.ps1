@@ -415,11 +415,31 @@ Describe 'Test-WHNvmeDriver (mocked)' {
     It 'reports nothing when the standard driver is used' {
         Mock Get-WHNvmeOverride { }
         Mock Get-Service { $null }
+        Mock Get-WHNvmeDiskDevice { }
         Test-WHNvmeDriver | Should -BeNullOrEmpty
+    }
+    It 'treats a loaded but unused driver as info only' {
+        Mock Get-WHNvmeOverride { }
+        Mock Get-Service { [pscustomobject]@{ Name = 'nvmedisk'; Status = 'Running' } }
+        Mock Get-WHNvmeDiskDevice { }
+        $f = Test-WHNvmeDriver
+        $f.Severity | Should -Be 'Info'
+        $f.FixIds.Count | Should -Be 0
+    }
+    It 'explains when the driver is in use but was enabled without the known overrides' {
+        Mock Get-WHNvmeOverride { }
+        Mock Get-Service { [pscustomobject]@{ Name = 'nvmedisk'; Status = 'Running' } }
+        Mock Get-WHNvmeDiskDevice { 'Samsung SSD 990 PRO 2TB' }
+        Mock Get-WHEvent { @() }
+        $f = Test-WHNvmeDriver
+        $f.Severity | Should -Be 'Critical'
+        ($f.Evidence -join ' ') | Should -Match 'Using nvmedisk: Samsung SSD 990 PRO 2TB'
+        ($f.Evidence -join ' ') | Should -Match 'enabled another way'
     }
     It 'flags the experimental driver and when it was first used' {
         Mock Get-WHNvmeOverride { '735209102', '1853569164' }
         Mock Get-Service { [pscustomobject]@{ Name = 'nvmedisk'; Status = 'Running' } }
+        Mock Get-WHNvmeDiskDevice { 'Samsung SSD 990 PRO 2TB' }
         Mock Get-WHEvent { @(
                 New-FakeEvent -Provider 'Microsoft-Windows-Kernel-PnP' -Id 400 -Time ([datetime]'2026-10-14') -Message 'Driver Name: nvmedisk.inf'
                 New-FakeEvent -Provider 'Microsoft-Windows-Kernel-PnP' -Id 400 -Time ([datetime]'2026-10-13 09:00') -Message 'Driver Name: nvmedisk.inf'
@@ -428,6 +448,14 @@ Describe 'Test-WHNvmeDriver (mocked)' {
         $f.Severity | Should -Be 'Critical'
         $f.FixIds | Should -Be @('DisableExperimentalNvmeDriver')
         ($f.Evidence -join ' ') | Should -Match 'First seen in use: 2026-10-13 09:00'
+    }
+}
+
+Describe 'Invoke-WHFix' {
+    It 'skips a fix that would change nothing instead of reporting success' {
+        Mock Get-WHNvmeOverride { }
+        $r = Invoke-WHFix -FixId DisableExperimentalNvmeDriver -Unattended -NoRestorePoint 6>$null
+        $r.Status | Should -Be 'Skipped'
     }
 }
 

@@ -655,21 +655,35 @@ function Get-WHNvmeOverride {
     }
 }
 
+function Get-WHNvmeDiskDevice {
+    # Devices actually bound to the experimental driver. The service can show
+    # as running without owning any device, so this is the real test.
+    @(Get-CimInstance Win32_PnPEntity -Filter "Service='nvmedisk'" -OperationTimeoutSec 20 -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+}
+
 function Test-WHNvmeDriver {
     $overrides = @(Get-WHNvmeOverride)
     $svc = Get-Service -Name nvmedisk -ErrorAction SilentlyContinue
     $running = [bool]($svc -and "$($svc.Status)" -eq 'Running')
-    if (-not $overrides.Count -and -not $running) { return }
+    $devices = @(Get-WHNvmeDiskDevice)
+    if (-not $overrides.Count -and -not $running -and -not $devices.Count) { return }
 
     $evidence = @()
-    if ($running) { $evidence += 'nvmedisk (experimental native NVMe driver) is running' }
+    foreach ($d in $devices) { $evidence += "Using nvmedisk: $d" }
+    if ($running -and -not $devices.Count) { $evidence += 'nvmedisk service is loaded but no device is using it' }
     if ($overrides.Count) { $evidence += "Feature overrides set: $($overrides -join ', ') under HKLM\SYSTEM\CurrentControlSet\Policies\Microsoft\FeatureManagement\Overrides" }
+    elseif ($devices.Count) { $evidence += 'None of the usual registry overrides are set, so it was enabled another way (e.g. ViVeTool feature ids). WinHealth cannot switch it off automatically; undo it the same way it was enabled.' }
     $pnp = @(Get-WHEvent @{ LogName = 'Microsoft-Windows-Kernel-PnP/Configuration'; Id = 400, 410 } -MaxEvents 5000 | Where-Object { $_.Message -match 'nvmedisk' })
     if ($pnp.Count) {
         $first = ($pnp | Sort-Object TimeCreated | Select-Object -First 1).TimeCreated
         $evidence += "First seen in use: $(Format-WHTime $first) - compare with when the freezes started"
     }
-    $sev = if ($running) { 'Critical' } else { 'Warning' }
+    if (-not $devices.Count -and -not $overrides.Count) {
+        New-WHFinding -Id 'nvme-experimental' -Category Storage -Severity Info -Title 'Experimental NVMe driver is loaded but unused' `
+            -Detail 'The nvmedisk driver is loaded, but no drive is using it; drives use the standard driver.' -Evidence $evidence
+        return
+    }
+    $sev = if ($devices.Count) { 'Critical' } else { 'Warning' }
     New-WHFinding -Id 'nvme-experimental' -Category Storage -Severity $sev -Title 'The experimental Windows NVMe driver is enabled' `
         -Detail 'Your NVMe drives are using the native NVMe driver that Microsoft made for Windows Server and that is only switched on in Windows 11 by registry override. It is not supported on Windows 11 and has known problems with some SSDs and tools: drives dropping out, hangs, failed writes and crashes. Switch back to the standard driver, restart, and see whether the freezes stop.' `
         -Evidence $evidence -FixIds 'DisableExperimentalNvmeDriver'
