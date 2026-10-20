@@ -248,6 +248,19 @@ Describe 'report' {
         $content | Should -Match '-Fix DisableFastStartup'
         (Get-Content $json -Raw | ConvertFrom-Json).Findings[0].Id | Should -Be 'x'
     }
+
+    It 'still writes the report under -WhatIf' {
+        $result = [pscustomobject]@{
+            SystemInfo = [pscustomobject]@{ ComputerName = 'PC'; OS = 'W'; Model = 'M'; BIOS = '1'; BIOSDate = $null
+                LastBoot = Get-Date; Uptime = New-TimeSpan; MemoryGB = 8; GeneratedAt = Get-Date }
+            Days = 7; Findings = @()
+        }
+        $json = Join-Path $TestDrive 'whatif.json'
+        $WhatIfPreference = $true
+        Export-WHJsonReport -Result $result -Path $json
+        $WhatIfPreference = $false
+        Test-Path $json | Should -BeTrue
+    }
 }
 
 Describe 'Get-WHEvent' {

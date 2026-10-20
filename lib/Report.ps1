@@ -151,5 +151,5 @@ function Export-WHJsonReport {
         }
         Days       = $Result.Days
         Findings   = $Result.Findings
-    } | ConvertTo-Json -Depth 5 | Set-Content -Path $Path -Encoding UTF8
+    } | ConvertTo-Json -Depth 5 | Set-Content -Path $Path -Encoding UTF8 -WhatIf:$false
 }

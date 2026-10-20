@@ -114,7 +114,8 @@ if ($Fix) { $fixIds = @($Fix | ForEach-Object { $_ -split ',' } | ForEach-Object
 if (-not $OutputPath) {
     $OutputPath = Join-Path $PSScriptRoot ("reports\" + (Get-Date -Format 'yyyy-MM-dd_HHmmss'))
 }
-$null = New-Item -ItemType Directory -Path $OutputPath -Force
+# -WhatIf is for fixes only; the report itself is always written.
+$null = New-Item -ItemType Directory -Path $OutputPath -Force -WhatIf:$false
 $OutputPath = (Resolve-Path $OutputPath).Path
 
 Write-Host 'Analysing... (this takes about a minute)' -ForegroundColor Cyan
