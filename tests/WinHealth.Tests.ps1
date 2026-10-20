@@ -283,3 +283,174 @@ Describe 'Get-WHEvent' {
         { Get-WHEvent @{ LogName = 'Security' } } | Should -Throw '*Access is denied*'
     }
 }
+
+Describe 'new parsers' {
+    It 'recognises Microsoft Store app updates' {
+        Test-WHStoreAppUpdate '9NKSQGP7F2NH-5319275A.WhatsAppDesktop' | Should -BeTrue
+        Test-WHStoreAppUpdate '9PDV73CBV7L8-Microsoft.Ink.Handwriting.Main.en-GB.1.0.1' | Should -BeTrue
+        Test-WHStoreAppUpdate '2026-10 Cumulative Update for Windows 11 Version 25H2 (KB5050001)' | Should -BeFalse
+        Test-WHStoreAppUpdate 'Security Intelligence Update for Microsoft Defender Antivirus - KB2267602' | Should -BeFalse
+    }
+
+    It 'finds the drive letter in storage messages' {
+        Get-WHVolumeFromMessage 'The system failed to flush data to the transaction log. Corruption may occur in VolumeId: E:, DeviceName: \Device\HarddiskVolume6.' | Should -Be 'E:'
+        Get-WHVolumeFromMessage 'A corruption was discovered in the file system structure on volume D:.' | Should -Be 'D:'
+        Get-WHVolumeFromMessage 'The device, \Device\Harddisk2\DR2, has a bad block.' | Should -BeNullOrEmpty
+    }
+
+    It 'names bugcheck codes' {
+        $i = Get-WHBugcheckInfo '0x000000ef'
+        $i.Code | Should -Be '0xEF'
+        $i.Name | Should -Be 'CRITICAL_PROCESS_DIED'
+        (Get-WHBugcheckInfo '0x00000124').Name | Should -Be 'WHEA_UNCORRECTABLE_ERROR'
+        (Get-WHBugcheckInfo '0x12345').Name | Should -Be ''
+    }
+
+    It 'parses !analyze -v output' {
+        $a = ConvertFrom-WHAnalyzeOutput @(
+            'BUGCHECK_CODE:  ef', 'PROCESS_NAME:  svchost.exe', 'CRITICAL_PROCESS:  svchost.exe',
+            'IMAGE_NAME:  nvmedisk.sys', 'MODULE_NAME: nvmedisk', 'FAILURE_BUCKET_ID:  0xEF_svchost.exe_BUGCHECK_CRITICAL_PROCESS_123'
+        )
+        $a.Process | Should -Be 'svchost.exe'
+        $a.Module | Should -Be 'nvmedisk.sys'
+        $a.Bucket | Should -Match '^0xEF_svchost'
+    }
+}
+
+Describe 'Find-WHSleepOutcome' {
+    BeforeAll {
+        $t0 = [datetime]'2026-10-15 23:00:00'
+        function New-Ev($min, $kind, $state = '') { [pscustomobject]@{ Time = $t0.AddMinutes($min); Kind = $kind; Detail = 'S3 sleep'; State = $state } }
+    }
+    It 'separates resumed sleeps from ones that never woke' {
+        $o = Find-WHSleepOutcome @(
+            (New-Ev 0 Sleep 4), (New-Ev 60 Resume),
+            (New-Ev 120 Sleep 4), (New-Ev 600 Boot), (New-Ev 600.2 Dirty)
+        )
+        $o.Count | Should -Be 2
+        $o[0].Outcome | Should -Be 'Resumed'
+        $o[1].Outcome | Should -Be 'NeverResumed'
+        $o[1].EndedBy | Should -Be 'Dirty'
+        $o[1].State | Should -Be '4'
+    }
+    It 'reports a trailing sleep as unknown' {
+        (Find-WHSleepOutcome @((New-Ev 0 Sleep 4)))[0].Outcome | Should -Be 'Unknown'
+    }
+}
+
+Describe 'Test-WHSleepHistory (mocked)' {
+    It 'says the PC never slept when there are no sleep events' {
+        Mock Get-WHEvent { @(New-FakeEvent -Provider 'EventLog' -Id 6005 -Time (Get-Date)) }
+        $f = Test-WHSleepHistory -Since (Get-Date).AddDays(-30)
+        $f.Title | Should -Be 'The PC has not gone to sleep in this period'
+    }
+    It 'flags a sleep that ended in a forced power-off, but not a Fast Startup hibernate' {
+        $t0 = [datetime]'2026-10-15 23:00:00'
+        $events = @(
+            New-FakeEvent -Provider 'Microsoft-Windows-Kernel-Power' -Id 42 -Time $t0 -Data ([ordered]@{ TargetState = '4' })
+            New-FakeEvent -Provider 'Microsoft-Windows-Kernel-General' -Id 12 -Time $t0.AddHours(8)
+            New-FakeEvent -Provider 'Microsoft-Windows-Kernel-Power' -Id 41 -Time $t0.AddHours(8).AddSeconds(5)
+            New-FakeEvent -Provider 'Microsoft-Windows-Kernel-Power' -Id 42 -Time $t0.AddDays(1) -Data ([ordered]@{ TargetState = '5' })
+            New-FakeEvent -Provider 'EventLog' -Id 6005 -Time $t0.AddDays(1).AddHours(1)
+        )
+        Mock Get-WHEvent { $events }
+        $f = Test-WHSleepHistory -Since $t0.AddDays(-1)
+        $f.Severity | Should -Be 'Critical'
+        $f.Title | Should -Be '1 of 2 sleeps never woke up'
+        $f.Evidence[0] | Should -Match 'S3 sleep -> never woke up; next event was a forced power-off'
+    }
+}
+
+Describe 'Test-WHUpdates (mocked)' {
+    It 'keeps Store app failures out of Windows Update failures' {
+        Mock Test-Path { $false }
+        Mock Get-WHRegistryValue { $null }
+        $events = @(
+            New-FakeEvent -Provider 'Microsoft-Windows-WindowsUpdateClient' -Id 20 -Time (Get-Date) -Data ([ordered]@{ errorCode = '0x80073d02'; updateTitle = '9NKSQGP7F2NH-5319275A.WhatsAppDesktop' })
+        )
+        Mock Get-WHEvent { $events }
+        $f = @(Test-WHUpdates -Since (Get-Date).AddDays(-1))
+        $f | Where-Object Id -EQ 'update-failures' | Should -BeNullOrEmpty
+        ($f | Where-Object Id -EQ 'store-update-failures').Severity | Should -Be 'Info'
+        ($f | Where-Object Id -EQ 'store-update-failures').FixIds.Count | Should -Be 0
+    }
+}
+
+Describe 'Test-WHHardwareErrors (mocked)' {
+    It 'is OK with no WHEA events' {
+        Mock Get-WHEvent { @() }
+        (Test-WHHardwareErrors -Since (Get-Date)).Severity | Should -Be 'OK'
+    }
+    It 'escalates fatal machine checks' {
+        $msg = "A fatal hardware error has occurred.`r`n`r`nComponent: Processor Core`r`nError Source: Machine Check Exception"
+        Mock Get-WHEvent { @(
+                New-FakeEvent -Provider 'Microsoft-Windows-WHEA-Logger' -Id 19 -Time (Get-Date) -Message 'x'
+                New-FakeEvent -Provider 'Microsoft-Windows-WHEA-Logger' -Id 18 -Time (Get-Date) -Message $msg
+            ) }
+        $f = Test-WHHardwareErrors -Since (Get-Date).AddDays(-1)
+        $f.Severity | Should -Be 'Critical'
+        ($f.Evidence -join ' ') | Should -Match 'Processor Core; Machine Check Exception'
+    }
+}
+
+Describe 'storage error records (mocked)' {
+    It 'tags each record with its drive and ignores other providers' {
+        Mock Get-WHEvent { @(
+                New-FakeEvent -Provider 'Microsoft-Windows-Ntfs' -Id 140 -Time (Get-Date) -Message "The system failed to flush data to the transaction log. Corruption may occur in VolumeId: E:, DeviceName: \Device\HarddiskVolume6.`r`n(A device which does not exist was specified.)"
+                New-FakeEvent -Provider 'SomethingElse' -Id 7 -Time (Get-Date) -Message 'not storage'
+            ) }
+        $r = @(Get-WHStorageErrorRecord -Since (Get-Date).AddDays(-1))
+        $r.Count | Should -Be 1
+        $r[0].Volume | Should -Be 'E:'
+        $r[0].Text | Should -Match '^The system failed to flush'
+    }
+}
+
+Describe 'Test-WHNvmeDriver (mocked)' {
+    BeforeAll {
+        if (-not (Get-Command Get-Service -ErrorAction SilentlyContinue)) {
+            function global:Get-Service { param($Name, $ErrorAction) }
+        }
+    }
+    It 'reports nothing when the standard driver is used' {
+        Mock Get-WHNvmeOverride { }
+        Mock Get-Service { $null }
+        Test-WHNvmeDriver | Should -BeNullOrEmpty
+    }
+    It 'flags the experimental driver and when it was first used' {
+        Mock Get-WHNvmeOverride { '735209102', '1853569164' }
+        Mock Get-Service { [pscustomobject]@{ Name = 'nvmedisk'; Status = 'Running' } }
+        Mock Get-WHEvent { @(
+                New-FakeEvent -Provider 'Microsoft-Windows-Kernel-PnP' -Id 400 -Time ([datetime]'2026-10-14') -Message 'Driver Name: nvmedisk.inf'
+                New-FakeEvent -Provider 'Microsoft-Windows-Kernel-PnP' -Id 400 -Time ([datetime]'2026-10-13 09:00') -Message 'Driver Name: nvmedisk.inf'
+            ) }
+        $f = Test-WHNvmeDriver
+        $f.Severity | Should -Be 'Critical'
+        $f.FixIds | Should -Be @('DisableExperimentalNvmeDriver')
+        ($f.Evidence -join ' ') | Should -Match 'First seen in use: 2026-10-13 09:00'
+    }
+}
+
+Describe 'Test-WHFixApplies' {
+    It 'drops fixes that would change nothing and caches the answer' {
+        $script:calls = 0
+        $catalog = [ordered]@{
+            Needed    = @{ Applies = { $script:calls++; $true } }
+            NotNeeded = @{ Applies = { $false } }
+            Always    = @{ }
+            Broken    = @{ Applies = { throw 'boom' } }
+        }
+        $cache = @{}
+        Test-WHFixApplies -Catalog $catalog -Id Needed -Cache $cache | Should -BeTrue
+        Test-WHFixApplies -Catalog $catalog -Id Needed -Cache $cache | Should -BeTrue
+        $script:calls | Should -Be 1
+        Test-WHFixApplies -Catalog $catalog -Id NotNeeded -Cache $cache | Should -BeFalse
+        Test-WHFixApplies -Catalog $catalog -Id Always -Cache $cache | Should -BeTrue
+        Test-WHFixApplies -Catalog $catalog -Id Broken -Cache $cache | Should -BeTrue
+        Test-WHFixApplies -Catalog $catalog -Id Missing -Cache $cache | Should -BeFalse
+    }
+    It 'does not offer turning off Fast Startup when it is already off' {
+        Mock Get-WHRegistryValue { 0 }
+        Test-WHFixApplies -Catalog (Get-WHFixCatalog) -Id DisableFastStartup -Cache @{} | Should -BeFalse
+    }
+}

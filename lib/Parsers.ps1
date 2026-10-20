@@ -182,3 +182,141 @@ function Group-WHCulprit {
         }
     } | Sort-Object @{ Expression = 'TotalMs'; Descending = $true }, @{ Expression = 'Count'; Descending = $true } | Select-Object -First $Top
 }
+
+function Test-WHStoreAppUpdate {
+    # Microsoft Store app updates show up in WindowsUpdateClient events with a
+    # 12-character Store product id prefix, e.g. "9NKSQGP7F2NH-5319275A.WhatsAppDesktop".
+    # They have nothing to do with OS updates or restarts.
+    param([string]$Title)
+    $Title -match '^[0-9][A-Z0-9]{11}-'
+}
+
+function Get-WHVolumeFromMessage {
+    # Pulls a drive letter out of a storage event message such as
+    # "... Corruption may occur in VolumeId: E:, DeviceName: ..." or
+    # "A corruption was discovered in the file system structure on volume E:."
+    param([string]$Message)
+    if ($Message -match '(?i)\bvolume(?:\s*id)?\s*:?\s*([A-Z]):') { return $Matches[1].ToUpper() + ':' }
+    $null
+}
+
+function Find-WHSleepOutcome {
+    # Pairs each "entering sleep" with what came next. A sleep followed by a
+    # resume is fine; one followed by a boot or power loss never woke up.
+    #
+    # Each input record: @{ Time = [datetime]; Kind = 'Sleep'|'Resume'|'Boot'|'Dirty'; Detail = '...'; State = '4' }
+    #   Sleep  - Kernel-Power 42 / 506 (entering sleep / Modern Standby); State = TargetState
+    #   Resume - Kernel-Power 107 / 507, Power-Troubleshooter 1
+    #   Boot   - EventLog 6005 / Kernel-General 12
+    #   Dirty  - Kernel-Power 41 / EventLog 6008
+    param([object[]]$Timeline)
+    $sorted = @($Timeline | Sort-Object Time)
+    $result = [System.Collections.Generic.List[object]]::new()
+    $pending = $null
+    $new = {
+        param($p, $outcome, $endKind, $endTime)
+        $state = if ($p.PSObject.Properties['State']) { "$($p.State)" } else { '' }
+        [pscustomobject]@{ SleptAt = $p.Time; Detail = $p.Detail; State = $state; Outcome = $outcome; EndedBy = $endKind; EndedAt = $endTime }
+    }
+    foreach ($e in $sorted) {
+        switch ($e.Kind) {
+            'Sleep' { if (-not $pending) { $pending = $e } }
+            'Resume' {
+                if ($pending) { $result.Add((& $new $pending 'Resumed' 'Resume' $e.Time)) }
+                $pending = $null
+            }
+            { $_ -eq 'Boot' -or $_ -eq 'Dirty' } {
+                if ($pending) { $result.Add((& $new $pending 'NeverResumed' $e.Kind $e.Time)) }
+                $pending = $null
+            }
+        }
+    }
+    if ($pending) {
+        # Last sleep in the log with nothing after it: the PC is asleep or we are mid-resume.
+        $result.Add((& $new $pending 'Unknown' $null $null))
+    }
+    # Boot and power-loss events are written together at startup in no fixed
+    # order; call it a forced power-off if one is nearby.
+    foreach ($r in $result) {
+        if ($r.Outcome -ne 'NeverResumed') { continue }
+        $forced = $sorted | Where-Object { $_.Kind -eq 'Dirty' -and $_.Time -ge $r.EndedAt -and $_.Time -le $r.EndedAt.AddMinutes(5) }
+        if ($forced) { $r.EndedBy = 'Dirty' }
+    }
+    @($result)
+}
+
+function Get-WHSleepStateName {
+    # Kernel-Power TargetState values (SYSTEM_POWER_STATE).
+    param($State)
+    switch ("$State") {
+        '2' { 'S1 sleep' } '3' { 'S2 sleep' } '4' { 'S3 sleep' } '5' { 'hibernate' } '6' { 'shutdown' }
+        default { if ("$State") { "state $State" } else { 'sleep' } }
+    }
+}
+
+function Get-WHBugcheckInfo {
+    # Plain-English meaning for common bugcheck codes, with a hint at the usual cause.
+    param([string]$Code)
+    $n = ConvertTo-WHInt $Code
+    $known = @{
+        0x0A  = @('IRQL_NOT_LESS_OR_EQUAL', 'a driver touched memory it should not; driver bug or unstable memory')
+        0x19  = @('BAD_POOL_HEADER', 'kernel memory corrupted; driver bug or unstable memory')
+        0x1A  = @('MEMORY_MANAGEMENT', 'memory corruption; test RAM and disable EXPO/XMP overclock')
+        0x1E  = @('KMODE_EXCEPTION_NOT_HANDLED', 'a driver crashed')
+        0x3B  = @('SYSTEM_SERVICE_EXCEPTION', 'a driver or system component crashed; often graphics or anti-cheat drivers')
+        0x50  = @('PAGE_FAULT_IN_NONPAGED_AREA', 'bad memory access; driver bug, unstable RAM or disk')
+        0x7A  = @('KERNEL_DATA_INPAGE_ERROR', 'Windows could not read data back from disk; failing disk, cable or storage driver')
+        0x7E  = @('SYSTEM_THREAD_EXCEPTION_NOT_HANDLED', 'a driver crashed')
+        0x9F  = @('DRIVER_POWER_STATE_FAILURE', 'a driver did not handle sleep/wake/shutdown in time')
+        0xA0  = @('INTERNAL_POWER_ERROR', 'power management failure, often during sleep or hibernate')
+        0xC2  = @('BAD_POOL_CALLER', 'a driver misused kernel memory')
+        0xD1  = @('DRIVER_IRQL_NOT_LESS_OR_EQUAL', 'a driver bug (network, storage and anti-cheat drivers are common)')
+        0xEF  = @('CRITICAL_PROCESS_DIED', 'an essential Windows process died; often a disk dropping out, unstable RAM, or corrupted system files')
+        0xF4  = @('CRITICAL_OBJECT_TERMINATION', 'an essential process ended; often the system disk dropping out')
+        0x101 = @('CLOCK_WATCHDOG_TIMEOUT', 'a CPU core stopped responding; CPU overclock/undervolt (PBO, Curve Optimizer) or BIOS')
+        0x116 = @('VIDEO_TDR_FAILURE', 'the graphics driver hung and could not recover')
+        0x117 = @('VIDEO_TDR_TIMEOUT_DETECTED', 'the graphics driver hung')
+        0x124 = @('WHEA_UNCORRECTABLE_ERROR', 'the hardware reported a fatal error; CPU/RAM overclock, voltages or failing hardware')
+        0x133 = @('DPC_WATCHDOG_VIOLATION', 'a driver blocked the CPU too long; storage or chipset drivers, SSD firmware')
+        0x139 = @('KERNEL_SECURITY_CHECK_FAILURE', 'kernel data corruption; driver bug or unstable memory')
+        0x13A = @('KERNEL_MODE_HEAP_CORRUPTION', 'a driver corrupted kernel memory')
+        0x154 = @('UNEXPECTED_STORE_EXCEPTION', 'memory compression store failed; disk or RAM problem')
+        0x1CA = @('SYNTHETIC_WATCHDOG_TIMEOUT', 'the system stopped responding')
+    }
+    $hex = '0x{0:X}' -f $n
+    if ($known.ContainsKey([int]$n)) {
+        [pscustomobject]@{ Code = $hex; Name = $known[[int]$n][0]; Hint = $known[[int]$n][1] }
+    } else {
+        [pscustomobject]@{ Code = $hex; Name = ''; Hint = '' }
+    }
+}
+
+function ConvertFrom-WHAnalyzeOutput {
+    # Extracts the useful lines from a debugger's "!analyze -v" output.
+    param([string[]]$Lines)
+    $fields = [ordered]@{}
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*(BUGCHECK_CODE|PROCESS_NAME|MODULE_NAME|IMAGE_NAME|FAILURE_BUCKET_ID|SYMBOL_NAME|CRITICAL_PROCESS):\s*(.+?)\s*$') {
+            if (-not $fields.Contains($Matches[1])) { $fields[$Matches[1]] = $Matches[2] }
+        }
+    }
+    [pscustomobject]@{
+        Process  = $(if ($fields.Contains('CRITICAL_PROCESS')) { $fields['CRITICAL_PROCESS'] } else { $fields['PROCESS_NAME'] })
+        Module   = $(if ($fields.Contains('IMAGE_NAME')) { $fields['IMAGE_NAME'] } else { $fields['MODULE_NAME'] })
+        Bucket   = $fields['FAILURE_BUCKET_ID']
+        Symbol   = $fields['SYMBOL_NAME']
+    }
+}
+
+function Get-WHWheaInfo {
+    # What each WHEA-Logger event id means for a home user.
+    param([int]$Id)
+    switch ($Id) {
+        1 { @{ Severity = 'Critical'; Text = 'Fatal hardware error (reported after the reboot it caused)' } }
+        18 { @{ Severity = 'Critical'; Text = 'Fatal machine-check error (CPU/memory/cache)' } }
+        19 { @{ Severity = 'Warning'; Text = 'Corrected machine-check error (CPU/memory/cache)' } }
+        17 { @{ Severity = 'Warning'; Text = 'Corrected PCI Express error (graphics card, NVMe or chipset link)' } }
+        47 { @{ Severity = 'Warning'; Text = 'Corrected memory error' } }
+        default { @{ Severity = 'Warning'; Text = "Hardware error event $Id" } }
+    }
+}

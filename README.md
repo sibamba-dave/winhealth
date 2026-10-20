@@ -33,10 +33,13 @@ If PowerShell refuses to run the script, use `Run-WinHealth.cmd`, or run `powers
 | Shutdown culprits | Diagnostics-Performance 200-210, Service Control Manager 7011/7043, Winlogon 6005/6006, `WaitToKillServiceTimeout` | Which apps, services or drivers held shutdown up |
 | Fast Startup | `HiberbootEnabled` | Whether "Shut down" is really a hibernate (a common cause of hangs) |
 | Sleep & wake | `powercfg /a /requests /waketimers /lastwake /devicequery`, Power-Troubleshooter 1, Kernel-Power 41 `SleepInProgress`, Diagnostics-Performance 300-310, sleep study | Modern Standby vs S3, hangs during sleep, wake time (firmware vs drivers), what wakes the PC, what blocks sleep |
-| Windows Update | Pending-reboot keys, WindowsUpdateClient 20 | Updates failing and retrying on every restart |
-| Crashes & drivers | Bugchecks 1001, minidumps, Device Manager errors, graphics/network/storage driver dates | Blue screens and drivers worth updating |
+| Sleep history | Kernel-Power 42/107/506/507 against boots and power losses | Whether the PC actually sleeps, and which sleeps never woke up |
+| Windows Update | Pending-reboot keys, WindowsUpdateClient 20 | Updates failing and retrying on every restart (Store app failures listed separately) |
+| Crashes & drivers | Bugchecks 1001, minidumps, Device Manager errors, graphics/network/storage driver dates | Blue screens by name and likely cause; with WinDbg installed, the process/driver from each dump |
+| Hardware errors | WHEA-Logger 1/17/18/19/47 | CPU, memory and PCIe errors (overclock/EXPO instability, failing hardware) |
 | Firmware | BIOS date, uptime | Old BIOS (vendors often fix sleep bugs there) |
-| Storage | Free space, dirty bit, disk health, disk/NTFS/NVMe errors | Disk problems that make wake and updates hang |
+| Storage | Free space, dirty bit, disk health, disk/NTFS/NVMe errors per drive | Which drive is failing or dropping out, and how it is connected |
+| NVMe driver | `nvmedisk` service, FeatureManagement overrides | Whether the experimental native NVMe driver has been switched on |
 
 ## Fixes
 
@@ -50,10 +53,13 @@ If PowerShell refuses to run the script, use `Run-WinHealth.cmd`, or run `powers
 | `ReduceServiceKillTimeout` | Shutdown waits at most 5 s for a hung service. |
 | `ResetWindowsUpdate` | Clears the Windows Update cache (old folders kept as backups). |
 | `RepairSystemFiles` | `DISM /RestoreHealth` + `sfc /scannow` (10-30 min). |
-| `ScheduleDiskCheck` | `chkdsk /f` on the system drive at next restart. |
+| `ScheduleDiskCheck` | Scans every drive named in recent disk errors and repairs it after asking; the system drive is checked at next restart. |
+| `DisableExperimentalNvmeDriver` | Removes the overrides that enable the experimental `nvmedisk` driver, so Windows goes back to `stornvme` after a restart. |
 | `RestoreDefaultPowerPlans` | Resets power plans to Windows defaults. |
 
-Each applied fix is written to `reports\<date>\fixes.json` with instructions to undo it.
+Each applied fix is written to `reports\<date>\fixes.json` with instructions to undo it. Fixes that would change nothing on your PC (e.g. Fast Startup is already off) are not offered.
+
+To have blue-screen dumps analysed automatically, install WinDbg (`winget install Microsoft.WinDbg`); WinHealth then runs `!analyze -v` on the newest dumps and saves the output next to the report.
 
 ## Suggested order for "won't restart / slow to wake"
 

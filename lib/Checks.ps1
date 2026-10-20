@@ -12,7 +12,9 @@
 #     Service Control Manager 7011/7043/7031/7034  service timeouts and crashes
 #     WindowsUpdateClient 20         update installation failure
 #     WER-SystemErrorReporting 1001  bugcheck (BSOD)
-#     disk 7/51/153, Ntfs 55/98      storage errors
+#     disk 7/51/153, Ntfs 55/98/140  storage errors
+#     Kernel-Power 506/507           entering / leaving Modern Standby
+#     WHEA-Logger 1/17/18/19/47      hardware errors (CPU, memory, PCIe)
 #   Application log
 #     Winlogon 6005/6006             notification subscriber slow on logoff/shutdown
 #   Microsoft-Windows-Diagnostics-Performance/Operational
@@ -335,23 +337,28 @@ function Test-WHUpdates {
     if ($renames) { $pending += "PendingFileRenameOperations: $(@($renames | Where-Object { $_ }).Count) entries" }
 
     $failures = Get-WHEvent @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WindowsUpdateClient'; Id = 20; StartTime = $Since } -MaxEvents 500
-    $failGroups = @()
-    if ($failures.Count -gt 0) {
-        $failGroups = @($failures | ForEach-Object {
-                $d = Get-WHEventDataMap $_
-                [pscustomobject]@{ Title = Get-WHMapValue $d 'updateTitle', 'Param1'; Code = Get-WHMapValue $d 'errorCode', 'Param0'; Time = $_.TimeCreated }
-            } | Group-Object Title | Sort-Object Count -Descending)
+    $records = @($failures | ForEach-Object {
+            $d = Get-WHEventDataMap $_
+            [pscustomobject]@{ Title = Get-WHMapValue $d 'updateTitle', 'Param1'; Code = Get-WHMapValue $d 'errorCode', 'Param0'; Time = $_.TimeCreated }
+        })
+    $storeFails = @($records | Where-Object { Test-WHStoreAppUpdate $_.Title })
+    $osFails = @($records | Where-Object { -not (Test-WHStoreAppUpdate $_.Title) })
+    $failGroups = @($osFails | Group-Object Title | Sort-Object Count -Descending)
+    $describe = {
+        "$($_.Name): failed $($_.Count)x, error $(($_.Group | Select-Object -ExpandProperty Code -Unique) -join ', ')"
     }
 
     if ($failGroups.Count -gt 0) {
         $repeated = @($failGroups | Where-Object { $_.Count -ge 2 })
-        $evidence = $failGroups | Select-Object -First 10 | ForEach-Object {
-            "$($_.Name): failed $($_.Count)x, error $(($_.Group | Select-Object -ExpandProperty Code -Unique) -join ', ')"
-        }
         $sev = if ($repeated.Count) { 'Critical' } else { 'Warning' }
-        New-WHFinding -Id 'update-failures' -Category Updates -Severity $sev -Title "Windows Update failures ($($failures.Count))" `
+        New-WHFinding -Id 'update-failures' -Category Updates -Severity $sev -Title "Windows Update failures ($($osFails.Count))" `
             -Detail 'Updates that fail and retry are a classic cause of "Restarting..." screens that hang or "Undoing changes" loops. Resetting the Windows Update cache and repairing system files usually clears it.' `
-            -Evidence $evidence -FixIds 'ResetWindowsUpdate', 'RepairSystemFiles'
+            -Evidence ($failGroups | Select-Object -First 10 | ForEach-Object $describe) -FixIds 'ResetWindowsUpdate', 'RepairSystemFiles'
+    }
+    if ($storeFails.Count -gt 0) {
+        New-WHFinding -Id 'store-update-failures' -Category Updates -Severity Info -Title "Microsoft Store app updates failed ($($storeFails.Count))" `
+            -Detail 'These are Store apps, not Windows itself, and do not affect shutdown or restart. They usually succeed on a later try; otherwise update them from the Store app.' `
+            -Evidence ($storeFails | Group-Object Title | Sort-Object Count -Descending | Select-Object -First 10 | ForEach-Object $describe)
     }
 
     if ($pending.Count -gt 0) {
@@ -363,20 +370,88 @@ function Test-WHUpdates {
     }
 }
 
+function Find-WHDebugger {
+    # kd.exe/cdb.exe from WinDbg (Store/winget) or the Windows SDK, if installed.
+    $candidates = @(
+        (Join-Path "${env:ProgramFiles(x86)}" 'Windows Kits\10\Debuggers\x64\kd.exe'),
+        (Join-Path $env:ProgramFiles 'Windows Kits\10\Debuggers\x64\kd.exe')
+    )
+    try {
+        $pkg = Get-AppxPackage -Name 'Microsoft.WinDbg*' -ErrorAction Stop | Select-Object -First 1
+        if ($pkg -and $pkg.InstallLocation) {
+            $candidates += @(Get-ChildItem -Path $pkg.InstallLocation -Filter 'kd.exe' -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DirectoryName -match 'amd64|x64' } | ForEach-Object FullName)
+        }
+    } catch {
+        Write-Verbose "Get-AppxPackage unavailable: $($_.Exception.Message)"
+    }
+    foreach ($c in $candidates) { if ($c -and (Test-Path $c)) { return $c } }
+    $cmd = Get-Command kd.exe, cdb.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    $null
+}
+
+function Invoke-WHDumpAnalysis {
+    # Runs "!analyze -v" on a crash dump. Needs internet for symbols; the full
+    # debugger output is saved next to the report.
+    param([string]$Debugger, [System.IO.FileInfo]$Dump, [string]$OutputPath, [int]$TimeoutSeconds = 240)
+    $symbols = Join-Path $env:TEMP 'WinHealthSymbols'
+    $outFile = Join-Path $OutputPath "analyze-$($Dump.BaseName).txt"
+    $dbgArgs = @('-z', "`"$($Dump.FullName)`"", '-y', "`"srv*$symbols*https://msdl.microsoft.com/download/symbols`"", '-c', '"!analyze -v; q"')
+    $p = Start-Process -FilePath $Debugger -ArgumentList $dbgArgs -RedirectStandardOutput $outFile -NoNewWindow -PassThru
+    if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+        try { $p.Kill() } catch { Write-Verbose 'debugger already exited' }
+        return $null
+    }
+    $parsed = ConvertFrom-WHAnalyzeOutput (Get-Content $outFile -ErrorAction SilentlyContinue)
+    $parsed | Add-Member -NotePropertyName OutputFile -NotePropertyValue $outFile -PassThru
+}
+
 function Test-WHStability {
-    param([datetime]$Since)
+    param([datetime]$Since, [string]$OutputPath)
     $bugchecks = Get-WHEvent @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting'; Id = 1001; StartTime = $Since } -MaxEvents 100
     $dumpDir = Join-Path $env:SystemRoot 'Minidump'
     $dumps = @()
     if (Test-Path $dumpDir) { $dumps = @(Get-ChildItem $dumpDir -Filter *.dmp -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $Since }) }
     if ($bugchecks.Count -gt 0 -or $dumps.Count -gt 0) {
+        $names = [System.Collections.Generic.List[string]]::new()
         $evidence = @($bugchecks | ForEach-Object {
-                $code = if ($_.Message -match '(0x[0-9a-fA-F]+)\s*\(') { $Matches[1] } else { 'unknown' }
-                "$(Format-WHTime $_.TimeCreated): bugcheck $code"
+                $code = if ($_.Message -match '(0x[0-9a-fA-F]+)\s*\(') { $Matches[1] } else { '' }
+                $info = Get-WHBugcheckInfo $code
+                if ($info.Name -and -not $names.Contains($info.Name)) { $names.Add($info.Name) }
+                if ($info.Name) { "$(Format-WHTime $_.TimeCreated): $($info.Code) $($info.Name) - $($info.Hint)" }
+                else { "$(Format-WHTime $_.TimeCreated): bugcheck $(if ($code) { $info.Code } else { 'unknown' })" }
             })
-        $evidence += $dumps | ForEach-Object { "Dump file: $($_.FullName)" }
-        New-WHFinding -Id 'bugchecks' -Category Stability -Severity Critical -Title "Blue-screen crashes ($([math]::Max($bugchecks.Count, $dumps.Count)))" `
-            -Detail 'Crashes during sleep/resume or shutdown (e.g. 0x9F DRIVER_POWER_STATE_FAILURE, 0x133 DPC_WATCHDOG_VIOLATION) are almost always driver bugs. Searching the bugcheck code plus your PC model usually finds the driver; the dump files can be opened with WinDbg (!analyze -v) or BlueScreenView.' `
+
+        $debugger = Find-WHDebugger
+        $recent = @($dumps | Sort-Object LastWriteTime -Descending | Select-Object -First 3)
+        foreach ($dump in $recent) {
+            $line = "Dump file: $($dump.FullName)"
+            if ($debugger -and $OutputPath) {
+                Write-Progress -Activity 'WinHealth analysis' -Status "Analysing crash dump $($dump.Name) (can take a few minutes the first time)"
+                $a = Invoke-WHDumpAnalysis -Debugger $debugger -Dump $dump -OutputPath $OutputPath
+                if ($a -and ($a.Process -or $a.Module -or $a.Bucket)) {
+                    $parts = @()
+                    if ($a.Process) { $parts += "process $($a.Process)" }
+                    if ($a.Module) { $parts += "driver/module $($a.Module)" }
+                    if ($a.Bucket) { $parts += "bucket $($a.Bucket)" }
+                    $line += " -> $($parts -join ', ') (full output: $($a.OutputFile))"
+                } else {
+                    $line += ' -> debugger could not analyse it (no internet for symbols?)'
+                }
+            }
+            $evidence += $line
+        }
+        $evidence += @($dumps | Sort-Object LastWriteTime -Descending | Select-Object -Skip 3 | ForEach-Object { "Dump file: $($_.FullName)" })
+        if ($dumps.Count -and -not $debugger) {
+            $evidence += 'To name the crashing process/driver automatically, install WinDbg (winget install Microsoft.WinDbg) and run WinHealth again.'
+        }
+
+        $count = [math]::Max($bugchecks.Count, $dumps.Count)
+        $title = "Blue-screen crashes ($count)"
+        if ($names.Count) { $title += ": $($names -join ', ')" }
+        New-WHFinding -Id 'bugchecks' -Category Stability -Severity Critical -Title $title `
+            -Detail 'The code says what kind of failure it was; the dump analysis (when available) names the process or driver involved. Driver bugs are the usual cause, but CRITICAL_PROCESS_DIED, KERNEL_DATA_INPAGE_ERROR and WHEA errors often mean disk or memory/overclock instability instead.' `
             -Evidence $evidence -FixIds 'RepairSystemFiles'
     } else {
         New-WHFinding -Id 'bugchecks' -Category Stability -Severity OK -Title 'No blue-screen crashes recorded'
@@ -402,6 +477,70 @@ function Test-WHStability {
         $title = if ($old.Count) { "$($old.Count) key driver(s) are over 2 years old" } else { 'Key drivers' }
         New-WHFinding -Id 'driver-age' -Category Stability -Severity $sev -Title $title `
             -Detail 'Graphics, network and storage drivers are the usual suspects for sleep/shutdown hangs. Get current versions from your PC maker (or Intel/AMD/NVIDIA) rather than relying on Windows Update.' -Evidence $evidence
+    }
+}
+
+function Test-WHHardwareErrors {
+    param([datetime]$Since)
+    $events = Get-WHEvent @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; StartTime = $Since } -MaxEvents 1000
+    if ($events.Count -eq 0) {
+        New-WHFinding -Id 'whea' -Category Stability -Severity OK -Title 'No hardware errors reported (WHEA)'
+        return
+    }
+    $worst = 'Warning'
+    $evidence = foreach ($g in ($events | Group-Object Id | Sort-Object Count -Descending)) {
+        $info = Get-WHWheaInfo ([int]$g.Name)
+        if ($info.Severity -eq 'Critical') { $worst = 'Critical' }
+        $latest = $g.Group | Sort-Object TimeCreated -Descending | Select-Object -First 1
+        $where = @()
+        if ($latest.Message -match 'Component:\s*(.+)') { $where += $Matches[1].Trim() }
+        if ($latest.Message -match 'Error Source:\s*(.+)') { $where += $Matches[1].Trim() }
+        "$($info.Text): $($g.Count)x, last $(Format-WHTime $latest.TimeCreated)$(if ($where) { " [$($where -join '; ')]" })"
+    }
+    New-WHFinding -Id 'whea' -Category Stability -Severity $worst -Title "Hardware errors reported ($($events.Count))" `
+        -Detail 'The CPU, memory or PCIe bus reported errors. This is the classic cause of random freezes and reboots that no driver update fixes. Most common on enthusiast PCs: turn off memory overclocks (EXPO/XMP) and CPU tuning (PBO, Curve Optimizer, undervolts) in the BIOS, update the BIOS, then test memory. For PCI Express errors, reseat the graphics card and NVMe drives.' `
+        -Evidence $evidence
+}
+
+function Test-WHSleepHistory {
+    param([datetime]$Since)
+    $events = Get-WHEvent @{ LogName = 'System'; Id = 1, 12, 41, 42, 107, 506, 507, 6005, 6008; StartTime = $Since } -MaxEvents 3000
+    $timeline = foreach ($e in $events) {
+        $kind = $null; $detail = ''; $state = ''
+        switch ("$($e.ProviderName)|$($e.Id)") {
+            'Microsoft-Windows-Kernel-Power|42' {
+                $state = Get-WHMapValue (Get-WHEventDataMap $e) 'TargetState'
+                $kind = 'Sleep'; $detail = Get-WHSleepStateName $state
+            }
+            'Microsoft-Windows-Kernel-Power|506' { $kind = 'Sleep'; $detail = 'Modern Standby' }
+            'Microsoft-Windows-Kernel-Power|107' { $kind = 'Resume' }
+            'Microsoft-Windows-Kernel-Power|507' { $kind = 'Resume' }
+            'Microsoft-Windows-Power-Troubleshooter|1' { $kind = 'Resume' }
+            'EventLog|6005' { $kind = 'Boot' }
+            'Microsoft-Windows-Kernel-General|12' { $kind = 'Boot' }
+            'EventLog|6008' { $kind = 'Dirty' }
+            'Microsoft-Windows-Kernel-Power|41' { $kind = 'Dirty' }
+        }
+        if ($kind) { [pscustomobject]@{ Time = $e.TimeCreated; Kind = $kind; Detail = $detail; State = "$state" } }
+    }
+    $outcomes = @(Find-WHSleepOutcome -Timeline @($timeline))
+    if ($outcomes.Count -eq 0) {
+        New-WHFinding -Id 'sleep-history' -Category Sleep -Severity Info -Title 'The PC has not gone to sleep in this period' `
+            -Detail 'Windows recorded no sleep at all. If the screen goes dark and the PC then will not respond, that is the display turning off while the PC freezes, not a sleep problem; see the unexpected reboots and hardware error findings.'
+        return
+    }
+    # Fast Startup "shutdown" is a hibernate that ends in a normal boot; that is not a failed wake.
+    $failed = @($outcomes | Where-Object { $_.Outcome -eq 'NeverResumed' -and -not ($_.State -eq '5' -and $_.EndedBy -eq 'Boot') })
+    $resumed = @($outcomes | Where-Object { $_.Outcome -eq 'Resumed' })
+    if ($failed.Count -gt 0) {
+        $evidence = $failed | Sort-Object SleptAt -Descending | ForEach-Object {
+            "$(Format-WHTime $_.SleptAt): went to $($_.Detail) -> never woke up; next event was $(if ($_.EndedBy -eq 'Dirty') { 'a forced power-off' } else { 'a fresh boot' }) at $(Format-WHTime $_.EndedAt)"
+        }
+        New-WHFinding -Id 'sleep-history' -Category Sleep -Severity Critical -Title "$($failed.Count) of $($outcomes.Count) sleeps never woke up" `
+            -Detail "The PC went to sleep and Windows never recorded waking up; the next thing in the log is a restart. ($($resumed.Count) sleeps did resume normally.) Usual causes: graphics, USB or network drivers, BIOS sleep bugs, or unstable memory/CPU settings that only fail on wake." `
+            -Evidence $evidence -FixIds 'RebuildHibernation', 'DisarmWakeDevices'
+    } else {
+        New-WHFinding -Id 'sleep-history' -Category Sleep -Severity OK -Title "All $($resumed.Count) recorded sleeps woke up normally"
     }
 }
 
@@ -436,29 +575,134 @@ function Test-WHStorage {
             -Detail 'The file system was not shut down cleanly. A disk check at next boot will repair it.' -Evidence ($dirty -join ' ') -FixIds 'ScheduleDiskCheck'
     }
 
-    if (Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue) {
-        $bad = @(Get-PhysicalDisk -ErrorAction SilentlyContinue | Where-Object { $_.HealthStatus -ne 'Healthy' })
+    # Storage cmdlets (Get-PhysicalDisk, Get-Disk) can hang when the storage
+    # stack is misbehaving, so query CIM directly with a timeout.
+    try {
+        $physical = @(Get-CimInstance -Namespace 'root/Microsoft/Windows/Storage' -ClassName MSFT_PhysicalDisk -OperationTimeoutSec 20 -ErrorAction Stop)
+        $bad = @($physical | Where-Object { $_.HealthStatus -ne 0 })
         if ($bad.Count -gt 0) {
             New-WHFinding -Id 'disk-health' -Category Storage -Severity Critical -Title 'A physical disk reports a health problem' `
                 -Detail 'Back up your data now. A failing disk causes slow wake, hangs and corrupted updates.' `
-                -Evidence ($bad | ForEach-Object { "$($_.FriendlyName): $($_.HealthStatus) / $($_.OperationalStatus)" })
+                -Evidence ($bad | ForEach-Object { "$($_.FriendlyName): $(ConvertTo-WHHealthName $_.HealthStatus)" })
         }
+    } catch {
+        New-WHFinding -Id 'disk-query-timeout' -Category Storage -Severity Warning -Title 'Windows storage management did not respond' `
+            -Detail 'Asking Windows for disk information timed out or failed. That itself suggests a storage driver or disk problem (see the NVMe driver and storage error findings).' `
+            -Evidence "$($_.Exception.Message)"
     }
 
+    $records = @(Get-WHStorageErrorRecord -Since $Since)
+    foreach ($g in ($records | Group-Object Volume | Sort-Object Count -Descending)) {
+        $vol = $g.Name
+        $label = if ($vol) { $vol } else { 'a disk (no drive letter in the log)' }
+        $evidence = @($g.Group | Group-Object Provider, Id | Sort-Object Count -Descending | ForEach-Object {
+                $first = $_.Group[0]
+                "$($first.Provider) $($first.Id): $($_.Count)x, last $(Format-WHTime (($_.Group | Sort-Object Time -Descending)[0].Time)) - $($first.Text)"
+            })
+        $bus = $null
+        if ($vol) {
+            $disk = Get-WHDriveDisk $vol
+            if ($disk) {
+                $bus = $disk.Bus
+                $evidence = @("$vol is on $($disk.Name) (connected via $bus, health $($disk.Health))") + $evidence
+            }
+        }
+        $detail = "Errors writing to or reading from $label. "
+        if (@($g.Group | Where-Object { $_.Id -eq 140 }).Count) {
+            $detail += 'Event 140 means Windows could not write to the drive at all - the drive or its connection dropped out for a moment. '
+        }
+        if ($bus -eq 'USB') {
+            $detail += 'It is a USB drive: plug it directly into a rear motherboard port (not a hub or front panel), try another cable, and use "Safely remove" before unplugging. '
+        } else {
+            $detail += 'Check the drive health (e.g. CrystalDiskInfo), reseat its cable or the NVMe drive, and update SSD firmware and storage drivers. '
+        }
+        $detail += 'A drive that drops out can freeze the whole PC, stall shutdown and crash Windows processes. Back up anything important on it.'
+        $sev = if ($g.Count -ge 10) { 'Critical' } else { 'Warning' }
+        $id = if ($vol) { "disk-errors-$($vol.TrimEnd(':').ToLower())" } else { 'disk-errors' }
+        New-WHFinding -Id $id -Category Storage -Severity $sev -Title "Storage errors on $label ($($g.Count))" `
+            -Detail $detail -Evidence $evidence -FixIds 'ScheduleDiskCheck'
+    }
+}
+
+function ConvertTo-WHHealthName {
+    param($Value)
+    switch ([int]$Value) { 0 { 'Healthy' } 1 { 'Warning' } 2 { 'Unhealthy' } default { 'Unknown' } }
+}
+
+function Get-WHDriveDisk {
+    # Disk behind a drive letter via CIM with a timeout (Get-Partition | Get-Disk can hang).
+    param([string]$Letter)
+    $busNames = @{ 1 = 'SCSI'; 3 = 'ATA'; 7 = 'USB'; 8 = 'RAID'; 10 = 'SAS'; 11 = 'SATA'; 12 = 'SD'; 17 = 'NVMe' }
+    try {
+        $part = Get-CimInstance -Namespace 'root/Microsoft/Windows/Storage' -ClassName MSFT_Partition -Filter "DriveLetter='$($Letter[0])'" -OperationTimeoutSec 20 -ErrorAction Stop | Select-Object -First 1
+        if (-not $part) { return $null }
+        $disk = Get-CimAssociatedInstance -InputObject $part -ResultClassName MSFT_Disk -OperationTimeoutSec 20 -ErrorAction Stop | Select-Object -First 1
+        if (-not $disk) { return $null }
+        $bus = if ($busNames.ContainsKey([int]$disk.BusType)) { $busNames[[int]$disk.BusType] } else { "bus type $($disk.BusType)" }
+        [pscustomobject]@{ Name = $disk.FriendlyName; Bus = $bus; Health = ConvertTo-WHHealthName $disk.HealthStatus }
+    } catch {
+        Write-Verbose "No disk info for ${Letter}: $($_.Exception.Message)"
+        $null
+    }
+}
+
+function Get-WHNvmeOverride {
+    # Feature-management overrides that switch Windows to the experimental
+    # native NVMe driver (nvmedisk.sys) instead of stornvme.sys.
+    $key = 'HKLM:\SYSTEM\CurrentControlSet\Policies\Microsoft\FeatureManagement\Overrides'
+    foreach ($name in '735209102', '1853569164', '156965516', '1176759950') {
+        if ((Get-WHRegistryValue $key $name) -eq 1) { $name }
+    }
+}
+
+function Test-WHNvmeDriver {
+    $overrides = @(Get-WHNvmeOverride)
+    $svc = Get-Service -Name nvmedisk -ErrorAction SilentlyContinue
+    $running = [bool]($svc -and "$($svc.Status)" -eq 'Running')
+    if (-not $overrides.Count -and -not $running) { return }
+
+    $evidence = @()
+    if ($running) { $evidence += 'nvmedisk (experimental native NVMe driver) is running' }
+    if ($overrides.Count) { $evidence += "Feature overrides set: $($overrides -join ', ') under HKLM\SYSTEM\CurrentControlSet\Policies\Microsoft\FeatureManagement\Overrides" }
+    $pnp = @(Get-WHEvent @{ LogName = 'Microsoft-Windows-Kernel-PnP/Configuration'; Id = 400, 410 } -MaxEvents 5000 | Where-Object { $_.Message -match 'nvmedisk' })
+    if ($pnp.Count) {
+        $first = ($pnp | Sort-Object TimeCreated | Select-Object -First 1).TimeCreated
+        $evidence += "First seen in use: $(Format-WHTime $first) - compare with when the freezes started"
+    }
+    $sev = if ($running) { 'Critical' } else { 'Warning' }
+    New-WHFinding -Id 'nvme-experimental' -Category Storage -Severity $sev -Title 'The experimental Windows NVMe driver is enabled' `
+        -Detail 'Your NVMe drives are using the native NVMe driver that Microsoft made for Windows Server and that is only switched on in Windows 11 by registry override. It is not supported on Windows 11 and has known problems with some SSDs and tools: drives dropping out, hangs, failed writes and crashes. Switch back to the standard driver, restart, and see whether the freezes stop.' `
+        -Evidence $evidence -FixIds 'DisableExperimentalNvmeDriver'
+}
+
+function Get-WHStorageErrorRecord {
+    param([datetime]$Since)
     # Filter providers client-side: naming a provider that is not installed
     # makes Get-WinEvent return nothing at all.
     $errors = @(Get-WHEvent @{ LogName = 'System'; Id = 7, 11, 51, 129, 153, 55, 98, 140; Level = 1, 2, 3; StartTime = $Since } -MaxEvents 500)
-    $relevant = @($errors | Where-Object { $_.ProviderName -in 'disk', 'Ntfs', 'Microsoft-Windows-Ntfs', 'storahci', 'stornvme', 'iaStorA', 'iaStorAC', 'iaStorAVC', 'nvme' })
-    if ($relevant.Count -gt 0) {
-        $evidence = $relevant | Group-Object ProviderName, Id | Sort-Object Count -Descending | ForEach-Object {
-            $first = $_.Group[0]
-            $msg = ("$($first.Message)" -split "`n")[0]
-            "$($first.ProviderName) $($first.Id): $($_.Count)x - $msg"
+    foreach ($e in $errors) {
+        if ($e.ProviderName -notin 'disk', 'Ntfs', 'Microsoft-Windows-Ntfs', 'storahci', 'stornvme', 'iaStorA', 'iaStorAC', 'iaStorAVC', 'nvme') { continue }
+        [pscustomobject]@{
+            Volume   = Get-WHVolumeFromMessage $e.Message
+            Provider = $e.ProviderName
+            Id       = $e.Id
+            Time     = $e.TimeCreated
+            Text     = ("$($e.Message)" -split "`r?`n")[0].Trim()
         }
-        New-WHFinding -Id 'disk-errors' -Category Storage -Severity Warning -Title "Storage errors in the event log ($($relevant.Count))" `
-            -Detail 'Disk timeouts (129, 153) and resets during resume make wake slow or hang. Update the storage/NVMe driver and SSD firmware; if bad blocks (7) appear, back up and check the drive.' `
-            -Evidence $evidence -FixIds 'ScheduleDiskCheck'
     }
+}
+
+function Get-WHDiskCheckTarget {
+    # Drives worth checking: the system drive if flagged dirty, plus every
+    # drive named in recent storage errors.
+    param([int]$Days = 30)
+    $targets = [System.Collections.Generic.List[string]]::new()
+    $dirty = (Invoke-WHNative 'fsutil.exe' 'dirty', 'query', $env:SystemDrive) -join ' '
+    if ($dirty -match 'is Dirty' -and $dirty -notmatch 'is NOT Dirty') { $targets.Add($env:SystemDrive.ToUpper()) }
+    foreach ($r in @(Get-WHStorageErrorRecord -Since (Get-Date).AddDays(-$Days))) {
+        if ($r.Volume -and -not $targets.Contains($r.Volume)) { $targets.Add($r.Volume) }
+    }
+    @($targets)
 }
 
 function Invoke-WHAllChecks {
@@ -471,10 +715,13 @@ function Invoke-WHAllChecks {
         @{ Name = 'Services at shutdown'; Run = { Test-WHServiceShutdown -Since $since } },
         @{ Name = 'Fast Startup'; Run = { Test-WHFastStartup } },
         @{ Name = 'Sleep & wake'; Run = { Test-WHSleep -Since $since -OutputPath $OutputPath } },
+        @{ Name = 'Sleep history'; Run = { Test-WHSleepHistory -Since $since } },
         @{ Name = 'Windows Update'; Run = { Test-WHUpdates -Since $since } },
-        @{ Name = 'Crashes & drivers'; Run = { Test-WHStability -Since $since } },
+        @{ Name = 'Crashes & drivers'; Run = { Test-WHStability -Since $since -OutputPath $OutputPath } },
+        @{ Name = 'Hardware errors'; Run = { Test-WHHardwareErrors -Since $since } },
         @{ Name = 'Firmware & uptime'; Run = { Test-WHBios -SystemInfo $info } },
-        @{ Name = 'Storage'; Run = { Test-WHStorage -Since $since } }
+        @{ Name = 'Storage'; Run = { Test-WHStorage -Since $since } },
+        @{ Name = 'NVMe driver'; Run = { Test-WHNvmeDriver } }
     )
     $findings = [System.Collections.Generic.List[object]]::new()
     $i = 0
@@ -488,6 +735,14 @@ function Invoke-WHAllChecks {
         }
     }
     Write-Progress -Activity 'WinHealth analysis' -Completed
+
+    # Drop fixes that would change nothing on this PC (e.g. Fast Startup already off).
+    $catalog = Get-WHFixCatalog
+    $cache = @{}
+    foreach ($f in $findings) {
+        $f.FixIds = @($f.FixIds | Where-Object { Test-WHFixApplies -Catalog $catalog -Id $_ -Cache $cache })
+    }
+
     [pscustomobject]@{
         SystemInfo = $info
         Days       = $Days
